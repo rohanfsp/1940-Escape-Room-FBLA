@@ -87,7 +87,9 @@ BG_FILES = {
     "CHALLENGE4": "bg_challenge4.png",
     "FINAL_DOOR": "bg_final_door.png",
     "TIME_TRAVELER": "bg_time_traveler.png",
-    "END": "bg_end.png"
+    "END": "bg_end.png",
+    "FAIL": "bg_fail.png" ,
+    "NOT_ENOUGH_POINTS": "bg_not_enough_points.png"
 }
 
 loaded_bgs = {}
@@ -377,7 +379,7 @@ def draw_button(text, x, y, width, height, color, hover_color, text_color=WHITE,
     screen.blit(text_surface, text_rect)
 
     if is_hovering and mouse_clicked:
-        pygame.time.wait(150)
+        pygame.time.wait(200)
         return True
     return False
 
@@ -494,7 +496,9 @@ def draw_challenge1():
                 pygame.display.flip()
                 pygame.time.wait(1000)
                 score -= PENALTY_POINTS
-                if score < 0: state = "END"
+                if score < 0:
+                    score = 0 
+                    state = "END"
                 return
 
 def draw_system_glitch():
@@ -551,7 +555,9 @@ def draw_challenge2():
                         pygame.display.flip()
                         pygame.time.wait(1500)
                         score -= PENALTY_POINTS
-                        if score < 0: state = "END"
+                        if score < 0: 
+                            score = 0 
+                            state = "END"
                         selected_order = []
 
     if selected_order and not challenge2_answered:
@@ -596,7 +602,9 @@ def draw_challenge3():
                 pygame.display.flip()
                 pygame.time.wait(1000)
                 score -= PENALTY_POINTS
-                if score < 0: state = "END"
+                if score < 0: 
+                    score = 0 
+                    state = "END"
                 return
 
 def draw_simulation_breach():
@@ -647,11 +655,12 @@ def draw_challenge4():
                 pygame.display.flip()
                 pygame.time.wait(1000)
                 score -= PENALTY_POINTS
-                if score < 0: state = "END"
+                if score < 0: 
+                    score = 0 
+                    state = "END"
 
 def draw_final_door():
     global state
-    draw_bg("FINAL_DOOR", BLACK)
     
     if not loaded_bgs["FINAL_DOOR"]:
         pygame.draw.rect(screen, BROWN, (300, 150, 200, 300))
@@ -659,9 +668,11 @@ def draw_final_door():
         pygame.draw.circle(screen, WHITE, (470, 300), 10)
 
     if score >= ESCAPE_SCORE_REQUIRED:
+        draw_bg("FINAL_DOOR", BLACK)
         if draw_button("Enter the Door", 250, 500, 300, 60, GREEN, DARK_GREEN):
             state = "TIME_TRAVELER"
     else:
+        draw_bg("NOT_ENOUGH_POINTS", BLACK)
         if draw_button("Try Again", 250, 500, 300, 60, RED, DARK_GRAY):
             reset_game()
             state = "TITLE"
@@ -675,12 +686,13 @@ def draw_time_traveler():
 
 def draw_end():
     global state
-    draw_bg("END", DARK_GREEN if score >= ESCAPE_SCORE_REQUIRED else DARK_GRAY)
 
     if score >= ESCAPE_SCORE_REQUIRED:
+        draw_bg("END", DARK_GREEN if score >= ESCAPE_SCORE_REQUIRED else DARK_GRAY)
         draw_text_centered(CONTENT.get("end_success", "YOU ESCAPED THE TIMELINE!"), 100, title_font, BEIGE)
         draw_text_centered("CONGRATULATIONS!", 180, heading_font, WHITE)
     else:
+        draw_bg("FAIL", DARK_GREEN if score >= ESCAPE_SCORE_REQUIRED else DARK_GRAY)
         draw_text_centered(CONTENT.get("end_failure", "TRAPPED IN 1940 FOREVER..."), 100, title_font, RED)
         draw_text_centered("Better luck next time!", 180, heading_font, WHITE)
 
@@ -1096,7 +1108,7 @@ def main():
         elif state == "SIMULATION_BREACH": draw_simulation_breach()
         elif state == "GOVERNMENT_CODE_ANALYST": draw_government_code_analyst()
         elif state == "CHALLENGE4": draw_challenge4()
-        elif state == "FINAL_DOOR": draw_final_door()
+        elif state == "FINAL_DOOR": draw_final_door()   
         elif state == "TIME_TRAVELER": draw_time_traveler()
         elif state == "END":
             if final_time == 0:
@@ -1124,3 +1136,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
