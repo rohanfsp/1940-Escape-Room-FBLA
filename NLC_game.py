@@ -1,10 +1,11 @@
-import pygame
-import json
-import os
-import sys
-import linecache
+import pygame       # Game engine: handles graphics, audio, and user input
+import json         # Read/write high scores and best times to disk
+import os           # Check if save files exist before loading
+import sys          # sys.settrace() hooks into the interpreter for live tracing
+import time         # Wall-clock timing for accurate game duration
+import linecache    # Read source code lines by number for the trace panels
 
-# Dynamically grabs the exact name of your Python file
+# Used by the trace system to filter only lines from this file
 CURRENT_FILE = os.path.basename(__file__)
 
 # Initialize Pygame and the Audio Mixer
@@ -23,12 +24,12 @@ except Exception as e:
 # DISPLAY SETTINGS
 # ============================================================================
 GAME_WIDTH = 800
-TECH_WIDTH = 450  # Extra width for the Tech/Debug Mode panels
+TECH_WIDTH = 450   # Window expands by this amount when a Tech Panel opens
 SCREEN_HEIGHT = 600
 
-# Panel mode can be None, "PYTHON_BASICS", "BASIC_DETAILS", "SIMULATED_TRACE", "LIVE_KEY_TRACE", "LIVE_FULL_TRACE"
-panel_mode = None 
-panel_scroll_y = 0  
+# Tracks which educational panel is open (None = closed, saves CPU)
+panel_mode = None
+panel_scroll_y = 0  # Scroll offset for panels with more content than fits on screen
 
 screen = pygame.display.set_mode((GAME_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption("1940 Escape Room - Timeline Mystery")
@@ -87,19 +88,22 @@ BG_FILES = {
     "CHALLENGE4": "bg_challenge4.png",
     "FINAL_DOOR": "bg_final_door.png",
     "TIME_TRAVELER": "bg_time_traveler.png",
-    "END": "bg_end.png"
+    "END": "bg_end.png",
+    "FAIL": "bg_fail.png" ,
+    "NOT_ENOUGH_POINTS": "bg_not_enough_points.png"
 }
 
+# Pre-load and scale all images at startup so there's no lag during gameplay
 loaded_bgs = {}
 for scene_state, filename in BG_FILES.items():
     try:
         img = pygame.image.load(filename).convert()
         loaded_bgs[scene_state] = pygame.transform.scale(img, (GAME_WIDTH, SCREEN_HEIGHT))
     except:
-        loaded_bgs[scene_state] = None
+        loaded_bgs[scene_state] = None  # Graceful fallback if an image file is missing
 
 def draw_bg(current_state, fallback_color):
-    """Draws the background image if it exists, otherwise uses the fallback color."""
+    """Renders the background for the current state, falling back to a solid color if the image is missing."""
     img = loaded_bgs.get(current_state)
     if img:
         screen.blit(img, (0, 0))
@@ -107,7 +111,9 @@ def draw_bg(current_state, fallback_color):
         screen.fill(fallback_color)
 
 # ============================================================================
-# CONTENT DICTIONARY 
+# CONTENT DICTIONARY — Separates game data from game logic.
+# All puzzle questions, answer choices, and correct answer indices live here
+# so they can be updated without touching any game code.
 # ============================================================================
 CONTENT = {
     "challenge1_options": ["Lend-lease act", "Freedom of Speech act", "Space Act", "Digital Act"],
@@ -238,22 +244,24 @@ CODE_LAYOUT_TEXT = [
 
 # ============================================================================
 # REAL-TIME TRACING LOGIC (Mode 4 and 5)
+# Uses sys.settrace() to hook into Python's interpreter and display every
+# line of code as it executes. This is the core educational feature of the game.
 # ============================================================================
-key_trace_log = []
-full_trace_log = []
+key_trace_log = []    # Filtered trace: only important logic (score changes, state transitions)
+full_trace_log = []   # Unfiltered trace: every single line the interpreter runs
 previous_state = "TITLE"
 
 def live_system_trace(frame, event, arg):
-    """
-    Hooks directly into the Python interpreter line-by-line!
-    """
+    """Callback registered with sys.settrace(). Python calls this on every line execution."""
     if event == 'line':
         co = frame.f_code
         func_name = co.co_name
         filename = co.co_filename
         line_no = frame.f_lineno
-        
+
         if CURRENT_FILE in filename:
+            # Skip UI rendering functions to prevent infinite recursion —
+            # tracing the panel that displays the trace would loop forever
             ignored_funcs = [
                 'render_wrapped_text', 'draw_side_panel', 'draw_score', 'draw_hints',
                 'draw_text_centered', 'draw_text_lines', 'get_state_function_and_key',
@@ -261,55 +269,65 @@ def live_system_trace(frame, event, arg):
             ]
             if func_name in ignored_funcs:
                 return live_system_trace
-                
+
             line_text = linecache.getline(filename, line_no).strip()
             if not line_text: return live_system_trace
 
             log_entry = f"L{line_no}: [{func_name}] {line_text}"
-            
+
+            # Mode 4: Key Trace — filters out rendering noise to show only game logic
             if panel_mode == "LIVE_KEY_TRACE":
                 ignore_noise = [
                     'pygame.', 'clock.tick', 'timer += 1', 'sys.settrace',
                     'draw_bg', 'draw_score', 'draw_hints', 'draw_music_icon',
                     'draw_side_panel', 'screen.fill', 'screen.blit', 'draw_text_centered'
                 ]
-                if any(n in line_text for n in ignore_noise): 
+                if any(n in line_text for n in ignore_noise):
                     return live_system_trace
-                
+
+                # Deduplicate against recent entries to keep the log readable
                 if log_entry not in key_trace_log[-40:]:
                     key_trace_log.append(log_entry)
                     if len(key_trace_log) > 1000: key_trace_log.pop(0)
 
+            # Mode 5: Full Trace — raw firehose of every executed line
             elif panel_mode == "LIVE_FULL_TRACE":
-                if "sys.settrace" in line_text: 
-                    return live_system_trace 
-                
+                # Must skip tracing sys.settrace itself to avoid recursion
+                if "sys.settrace" in line_text:
+                    return live_system_trace
+
                 if not full_trace_log or full_trace_log[-1] != log_entry:
                     full_trace_log.append(log_entry)
                     if len(full_trace_log) > 1000: full_trace_log.pop(0)
 
+    # Returning itself keeps the trace hook active for the next line
     return live_system_trace
 
 # ============================================================================
 # GAME STATE VARIABLES
+# The game uses a Finite State Machine: one string variable ("state") controls
+# which room is displayed. Each room has a draw_*() function that renders it.
 # ============================================================================
-state = "TITLE"
+state = "TITLE"                 # Current room in the state machine
 score = 0
-POINTS_PER_CHALLENGE = 75
-PENALTY_POINTS = 50
-ESCAPE_SCORE_REQUIRED = 200
-high_score = 0
-best_time = 0
-challenge1_answered = False
+POINTS_PER_CHALLENGE = 75       # Reward for a correct answer
+PENALTY_POINTS = 50             # Deduction for a wrong answer
+ESCAPE_SCORE_REQUIRED = 200     # Minimum score needed to escape (must ace 3 of 4)
+high_score = 0                  # Loaded from disk, persists across sessions
+best_time = 0.0                 # Fastest winning run, loaded from disk
+challenge1_answered = False     # Prevents re-answering a solved challenge
 challenge2_answered = False
 challenge3_answered = False
 challenge4_answered = False
-selected_order = []
-timer = 0
-final_time = 0
+selected_order = []             # Challenge 2: tracks which events the player picked in order
+start_time = None               # Set on game start, used with time.time() for wall-clock duration
+mouse_was_pressed = False       # Tracks previous frame's mouse state to detect fresh clicks
+final_time = 0.0                # Captured once when reaching END screen
 
 # ============================================================================
-# FILE I/O
+# FILE I/O — Non-volatile persistence using JSON files.
+# Scores survive application restarts because they're written to disk,
+# not just stored in RAM which is cleared when the program closes.
 # ============================================================================
 def load_high_score():
     global high_score
@@ -348,6 +366,7 @@ def load_best_time():
         best_time = 0
 
 def save_best_time():
+    """Only saves if the player won AND beat their previous best — prevents losing runs from overwriting records."""
     global best_time, final_time, score
     try:
         if score >= ESCAPE_SCORE_REQUIRED:
@@ -362,8 +381,14 @@ def save_best_time():
 # HELPER FUNCTIONS - UI DRAWING
 # ============================================================================
 def draw_button(text, x, y, width, height, color, hover_color, text_color=WHITE, font=text_font):
+    """Renders a button AND handles click detection in one function.
+    Uses edge detection (mouse_was_pressed) to register only the frame
+    the mouse transitions from UP to DOWN, preventing double-clicks."""
+    global mouse_was_pressed
     mouse_pos = pygame.mouse.get_pos()
-    mouse_clicked = pygame.mouse.get_pressed()[0]
+    mouse_down = pygame.mouse.get_pressed()[0]
+    # Only true on the exact frame the mouse button is first pressed
+    fresh_click = mouse_down and not mouse_was_pressed
 
     button_rect = pygame.Rect(x, y, width, height)
     is_hovering = button_rect.collidepoint(mouse_pos)
@@ -376,35 +401,34 @@ def draw_button(text, x, y, width, height, color, hover_color, text_color=WHITE,
     text_rect = text_surface.get_rect(center=button_rect.center)
     screen.blit(text_surface, text_rect)
 
-    if is_hovering and mouse_clicked:
-        pygame.time.wait(150)
+    if is_hovering and fresh_click:
         return True
     return False
 
 def draw_music_icon():
-    global music_playing
+    global music_playing, mouse_was_pressed
     mouse_pos = pygame.mouse.get_pos()
-    mouse_clicked = pygame.mouse.get_pressed()[0]
-    
+    mouse_down = pygame.mouse.get_pressed()[0]
+    fresh_click = mouse_down and not mouse_was_pressed
+
     icon_x = GAME_WIDTH - 45
     icon_y = 15
     icon_rect = pygame.Rect(icon_x - 5, icon_y - 5, 40, 30)
     is_hovering = icon_rect.collidepoint(mouse_pos)
-    
+
     color = WHITE if is_hovering else GRAY
-    
+
     pygame.draw.rect(screen, color, (icon_x, icon_y + 6, 6, 8))
     pygame.draw.polygon(screen, color, [(icon_x + 6, icon_y + 6), (icon_x + 14, icon_y), (icon_x + 14, icon_y + 20), (icon_x + 6, icon_y + 14)])
-    
+
     if music_playing:
         pygame.draw.line(screen, color, (icon_x + 18, icon_y + 6), (icon_x + 18, icon_y + 14), 2)
         pygame.draw.line(screen, color, (icon_x + 22, icon_y + 3), (icon_x + 22, icon_y + 17), 2)
     else:
         pygame.draw.line(screen, RED, (icon_x + 18, icon_y + 5), (icon_x + 26, icon_y + 15), 3)
         pygame.draw.line(screen, RED, (icon_x + 26, icon_y + 5), (icon_x + 18, icon_y + 15), 3)
-        
-    if is_hovering and mouse_clicked:
-        pygame.time.wait(200)
+
+    if is_hovering and fresh_click:
         music_playing = not music_playing
         if music_playing:
             pygame.mixer.music.unpause()
@@ -430,16 +454,17 @@ def draw_score():
 # STATE DRAWING FUNCTIONS 
 # ============================================================================
 def draw_title():
-    global state, high_score, score, best_time
+    global state, high_score, score, best_time, start_time
     draw_bg("TITLE", DARK_BLUE)
-    
+
     draw_text_centered(f"High Score: {high_score}", 270, text_font, WHITE)
     if best_time > 0:
-        draw_text_centered(f"Best Time: {(best_time / FPS):.2f} seconds", 310, text_font, BEIGE)
+        draw_text_centered(f"Best Time: {best_time:.2f} seconds", 310, text_font, BEIGE)
     else:
         draw_text_centered("Best Time: N/A", 310, text_font, BEIGE)
 
     if draw_button("START GAME", 250, 410, 300, 60, BLUE, GREEN):
+        start_time = time.time()
         state = "INSTRUCTIONS"
     if draw_button("QUIT", 250, 490, 300, 60, RED, DARK_GRAY):
         return "QUIT"
@@ -474,6 +499,9 @@ def draw_fdr_broadcast():
         state = "CHALLENGE1"
 
 def draw_challenge1():
+    """Challenge 1: Multiple choice — Which act helped allies before the US entered WWII?
+    Dynamically reads options from the CONTENT dictionary so questions can be changed
+    without modifying this function. Correct answer index is CONTENT['challenge1_correct']."""
     global state, score, challenge1_answered
     draw_bg("CHALLENGE1", DARK_GRAY)
 
@@ -494,7 +522,9 @@ def draw_challenge1():
                 pygame.display.flip()
                 pygame.time.wait(1000)
                 score -= PENALTY_POINTS
-                if score < 0: state = "END"
+                if score < 0:
+                    score = 0 
+                    state = "END"
                 return
 
 def draw_system_glitch():
@@ -522,6 +552,9 @@ def draw_factory_worker():
         state = "CHALLENGE2"
 
 def draw_challenge2():
+    """Challenge 2: Sequencing — arrange 4 WWII events in chronological order.
+    Unlike the other challenges, this requires the player to select all 4 events
+    in the correct sequence. Already-selected events are grayed out (input validation)."""
     global state, score, challenge2_answered, selected_order
     draw_bg("CHALLENGE2", DARK_BLUE)
 
@@ -531,16 +564,18 @@ def draw_challenge2():
             state = "COMMAND_POST"
         return
 
+    # Show the player's current selection progress
     if selected_order:
         order_text = "Your order: " + " → ".join([str(i+1) for i in selected_order])
         draw_text_centered(order_text, 130, small_font, BEIGE)
 
     for i, event in enumerate(CONTENT["challenge2_events"]):
+        # Gray out already-selected events to prevent duplicate selection
         color = DARK_GRAY if i in selected_order else BLUE
         hover = DARK_GRAY if i in selected_order else GREEN
 
         if draw_button(event, 150, 200 + i * 85, 500, 70, color, hover):
-            if i not in selected_order:
+            if i not in selected_order:  # Validate: reject clicks on already-selected events
                 selected_order.append(i)
                 if len(selected_order) == 4:
                     if selected_order == [0, 1, 2, 3]:
@@ -551,7 +586,9 @@ def draw_challenge2():
                         pygame.display.flip()
                         pygame.time.wait(1500)
                         score -= PENALTY_POINTS
-                        if score < 0: state = "END"
+                        if score < 0: 
+                            score = 0 
+                            state = "END"
                         selected_order = []
 
     if selected_order and not challenge2_answered:
@@ -596,7 +633,9 @@ def draw_challenge3():
                 pygame.display.flip()
                 pygame.time.wait(1000)
                 score -= PENALTY_POINTS
-                if score < 0: state = "END"
+                if score < 0: 
+                    score = 0 
+                    state = "END"
                 return
 
 def draw_simulation_breach():
@@ -647,21 +686,26 @@ def draw_challenge4():
                 pygame.display.flip()
                 pygame.time.wait(1000)
                 score -= PENALTY_POINTS
-                if score < 0: state = "END"
+                if score < 0: 
+                    score = 0 
+                    state = "END"
 
 def draw_final_door():
+    """The gate check: player needs >= 200 points (correct on at least 3 of 4 challenges).
+    If they don't qualify, they restart the entire game."""
     global state
-    draw_bg("FINAL_DOOR", BLACK)
-    
+
     if not loaded_bgs["FINAL_DOOR"]:
         pygame.draw.rect(screen, BROWN, (300, 150, 200, 300))
         pygame.draw.rect(screen, BEIGE, (300, 150, 200, 300), 5)
         pygame.draw.circle(screen, WHITE, (470, 300), 10)
 
     if score >= ESCAPE_SCORE_REQUIRED:
+        draw_bg("FINAL_DOOR", BLACK)
         if draw_button("Enter the Door", 250, 500, 300, 60, GREEN, DARK_GREEN):
             state = "TIME_TRAVELER"
     else:
+        draw_bg("NOT_ENOUGH_POINTS", BLACK)
         if draw_button("Try Again", 250, 500, 300, 60, RED, DARK_GRAY):
             reset_game()
             state = "TITLE"
@@ -675,23 +719,23 @@ def draw_time_traveler():
 
 def draw_end():
     global state
-    draw_bg("END", DARK_GREEN if score >= ESCAPE_SCORE_REQUIRED else DARK_GRAY)
 
     if score >= ESCAPE_SCORE_REQUIRED:
+        draw_bg("END", DARK_GREEN if score >= ESCAPE_SCORE_REQUIRED else DARK_GRAY)
         draw_text_centered(CONTENT.get("end_success", "YOU ESCAPED THE TIMELINE!"), 100, title_font, BEIGE)
         draw_text_centered("CONGRATULATIONS!", 180, heading_font, WHITE)
     else:
+        draw_bg("FAIL", DARK_GREEN if score >= ESCAPE_SCORE_REQUIRED else DARK_GRAY)
         draw_text_centered(CONTENT.get("end_failure", "TRAPPED IN 1940 FOREVER..."), 100, title_font, RED)
         draw_text_centered("Better luck next time!", 180, heading_font, WHITE)
 
     draw_text_centered(f"Final Score: {score} / 300", 260, heading_font, WHITE)
     draw_text_centered(f"High Score: {high_score}", 320, text_font, BEIGE)
 
-    time_seconds = final_time / FPS if final_time > 0 else 0.0
-    draw_text_centered(f"Time: {time_seconds:.2f} seconds", 365, text_font, WHITE)
+    draw_text_centered(f"Time: {final_time:.2f} seconds", 365, text_font, WHITE)
 
     if best_time > 0:
-        draw_text_centered(f"Best Time: {(best_time / FPS):.2f} seconds", 400, text_font, BEIGE)
+        draw_text_centered(f"Best Time: {best_time:.2f} seconds", 400, text_font, BEIGE)
     else:
         draw_text_centered("Best Time: N/A", 400, text_font, BEIGE)
 
@@ -707,18 +751,22 @@ def draw_end():
 
 def reset_game():
     global score, challenge1_answered, challenge2_answered, challenge3_answered
-    global challenge4_answered, selected_order, timer, final_time
+    global challenge4_answered, selected_order, start_time, final_time
     score = 0
     challenge1_answered = False
     challenge2_answered = False
     challenge3_answered = False
     challenge4_answered = False
     selected_order = []
-    timer = 0
-    final_time = 0
+    start_time = None
+    final_time = 0.0
 
 # ============================================================================
 # TECH & SUPER DEBUG MODES RENDERING
+# Five educational panels (keys 1-5) that teach Python concepts in real-time.
+# When opened, the window expands by 450px to show the panel alongside the game.
+# Modes 1-3 display static/generated educational content.
+# Modes 4-5 use sys.settrace() for live interpreter tracing — the key differentiator.
 # ============================================================================
 
 def render_wrapped_text(surface, text, font, color, x, y, max_width):
@@ -1028,16 +1076,21 @@ def draw_side_panel():
 
 # ============================================================================
 # MAIN GAME LOOP
+# Runs at 60 FPS. Each frame: (1) listen for input, (2) evaluate game state,
+# (3) render to screen. This is the standard game loop architecture used
+# in all real-time applications from mobile apps to AAA game engines.
 # ============================================================================
 
 def main():
-    global state, previous_state, score, timer, final_time, best_time, panel_mode, panel_scroll_y, screen
+    global state, previous_state, score, start_time, final_time, best_time, panel_mode, panel_scroll_y, screen, mouse_was_pressed
 
+    # Load persistent records from JSON files on disk
     load_high_score()
     load_best_time()
 
     running = True
     while running:
+        # Log state transitions so the trace panels can display scene changes
         if state != previous_state:
             sep = f"\n--- ENTERED SCENE: {state} ---"
             if not key_trace_log or key_trace_log[-1] != sep: 
@@ -1058,6 +1111,7 @@ def main():
                     if panel_scroll_y > 0:
                         panel_scroll_y = 0
 
+            # Toggle Tech Panels with keys 1-5 (press again to close)
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_1:
                     panel_mode = None if panel_mode == "PYTHON_BASICS" else "PYTHON_BASICS"
@@ -1068,19 +1122,23 @@ def main():
                 elif event.key == pygame.K_3:
                     panel_mode = None if panel_mode == "SIMULATED_TRACE" else "SIMULATED_TRACE"
                     sys.settrace(None); panel_scroll_y = 0 
+                # Modes 4 & 5 activate sys.settrace() — only these modes hook the interpreter
                 elif event.key == pygame.K_4:
                     panel_mode = None if panel_mode == "LIVE_KEY_TRACE" else "LIVE_KEY_TRACE"
-                    panel_scroll_y = 0 
+                    panel_scroll_y = 0
                     sys.settrace(live_system_trace if panel_mode == "LIVE_KEY_TRACE" else None)
                 elif event.key == pygame.K_5:
                     panel_mode = None if panel_mode == "LIVE_FULL_TRACE" else "LIVE_FULL_TRACE"
-                    panel_scroll_y = 0 
+                    panel_scroll_y = 0
                     sys.settrace(live_system_trace if panel_mode == "LIVE_FULL_TRACE" else None)
                 
+                # Dynamically resize window: expand when panel opens, shrink when it closes
                 screen = pygame.display.set_mode((GAME_WIDTH + TECH_WIDTH if panel_mode else GAME_WIDTH, SCREEN_HEIGHT))
 
+        # --- STEP 2: Evaluate game state and call the matching draw function ---
         screen.fill(BLACK)
 
+        # Finite State Machine dispatch: the state string routes to the correct room
         if state == "TITLE":
             if draw_title() == "QUIT": running = False
         elif state == "INSTRUCTIONS": draw_instructions()
@@ -1096,31 +1154,36 @@ def main():
         elif state == "SIMULATION_BREACH": draw_simulation_breach()
         elif state == "GOVERNMENT_CODE_ANALYST": draw_government_code_analyst()
         elif state == "CHALLENGE4": draw_challenge4()
-        elif state == "FINAL_DOOR": draw_final_door()
+        elif state == "FINAL_DOOR": draw_final_door()   
         elif state == "TIME_TRAVELER": draw_time_traveler()
         elif state == "END":
-            if final_time == 0:
-                final_time = timer
+            # Capture final time exactly once using wall-clock difference
+            if final_time == 0 and start_time is not None:
+                final_time = time.time() - start_time
                 save_best_time()
                 save_high_score()
             if draw_end() == "QUIT": running = False
 
-        draw_hints()
-        draw_music_icon()
+        # --- STEP 3: Render HUD elements that appear on every screen ---
+        draw_hints()       # Tech Panel hotkey guide at top of screen
+        draw_music_icon()  # Mute/unmute toggle in top-right corner
         if state not in ["TITLE", "INSTRUCTIONS", "END"]:
-            draw_score()
+            draw_score()   # Only show score during active gameplay
 
-        draw_side_panel()
+        draw_side_panel()  # Render the Tech Panel if one is open
 
-        if state != "END":
-            timer += 1
+        # Update mouse state for next frame's edge detection (prevents double-clicks)
+        mouse_was_pressed = pygame.mouse.get_pressed()[0]
 
-        pygame.display.flip()
-        clock.tick(FPS)
+        pygame.display.flip()  # Swap the hidden canvas onto the visible screen
+        clock.tick(FPS)        # Cap at 60 FPS to keep game speed consistent
 
+    # Clean up: disable trace hook and close Pygame before exiting
     sys.settrace(None)
     pygame.quit()
     sys.exit()
 
+# Entry point: only runs main() when executed directly (not when imported as a module)
 if __name__ == "__main__":
     main()
+
